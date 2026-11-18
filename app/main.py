@@ -148,7 +148,7 @@ async def create_events(events: list[EventCreate], db: DBDep) -> list[EventView]
     "/events",
     response_model=EventPage,
     tags=["events"],
-    summary="Query events by tenant and/or type within a time range",
+    summary="Query events by tenant, sequence range and/or type within a time range",
 )
 async def list_events(
     db: DBDep,
@@ -156,14 +156,35 @@ async def list_events(
     event_type: str | None = Query(None, description="Filter by event type"),
     since: datetime | None = Query(None, description="occurred_at >= since"),
     until: datetime | None = Query(None, description="occurred_at < until"),
+    seq_from: int | None = Query(
+        None, ge=1, description="tenant_seq >= seq_from (requires tenant_id)"
+    ),
+    seq_to: int | None = Query(
+        None, ge=1, description="tenant_seq <= seq_to (requires tenant_id)"
+    ),
+    sort: str = Query(
+        "recent",
+        pattern="^(recent|tenant_seq_asc)$",
+        description="recent = newest occurred_at first; tenant_seq_asc = audit order within a tenant",
+    ),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> EventPage:
+    # A sequence number is only meaningful inside one tenant, so range filters require it.
+    if (seq_from is not None or seq_to is not None) and not tenant_id:
+        raise HTTPException(
+            status_code=422, detail="seq_from/seq_to require a tenant_id filter"
+        )
+    if seq_from is not None and seq_to is not None and seq_from > seq_to:
+        raise HTTPException(status_code=422, detail="seq_from must not be greater than seq_to")
     rows = await db.query_events(
         tenant_id=tenant_id,
         event_type=event_type,
         since=since,
         until=until,
+        seq_from=seq_from,
+        seq_to=seq_to,
+        sort=sort,
         limit=limit,
         offset=offset,
     )

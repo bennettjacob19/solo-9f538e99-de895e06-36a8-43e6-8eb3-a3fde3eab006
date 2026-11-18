@@ -14,6 +14,10 @@ from psycopg_pool import AsyncConnectionPool
 from .config import settings
 from .models import IndexView
 
+# Session-local switch used only by the one-time backfill migration. A custom GUC needs
+# a simple name, so it intentionally does not embed the (possibly quoted) table name.
+BACKFILL_GUC = "app.audit_event_backfill"
+
 
 class Database:
     """Thin async wrapper around a psycopg connection pool."""
@@ -42,10 +46,31 @@ class Database:
     def qualified_table(self) -> sql.Composed:
         return sql.SQL("{}.{}").format(sql.Identifier(self.schema), sql.Identifier(self.table))
 
+    def _counter_table(self) -> sql.Composed:
+        return sql.SQL("{}.{}").format(
+            sql.Identifier(self.schema), sql.Identifier(f"{self.table}_tenant_seq")
+        )
+
+    def _assign_fn(self) -> sql.Composed:
+        return sql.SQL("{}.{}").format(
+            sql.Identifier(self.schema), sql.Identifier(f"{self.table}_assign_tenant_seq")
+        )
+
+    def _guard_fn(self) -> sql.Composed:
+        return sql.SQL("{}.{}").format(
+            sql.Identifier(self.schema), sql.Identifier(f"{self.table}_guard_event")
+        )
+
     # ------------------------------------------------------------------ bootstrap
 
     async def ensure_schema(self) -> None:
-        """Create the events table. Executed repeatedly at startup, so it is idempotent."""
+        """Create or upgrade the events table. Executed at every startup, so it is idempotent.
+
+        The tenant_seq upgrade runs as one transaction: add the column, install the
+        counter table and triggers, backfill existing rows (per tenant, id ascending),
+        then enforce NOT NULL and uniqueness. Any failure rolls the whole migration
+        back, so a half-backfilled table can never be left behind.
+        """
         async with self.pool.connection() as conn:
             await conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema)))
             await conn.execute(
@@ -73,6 +98,178 @@ class Database:
                         sql.Identifier(column),
                     )
                 )
+            await self._ensure_tenant_seq(conn)
+
+    async def _ensure_tenant_seq(self, conn: psycopg.AsyncConnection) -> None:
+        """Idempotent tenant_seq migration; safe to run again after a restart."""
+        table = self.qualified_table()
+        col_exists = await conn.execute(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s AND column_name = 'tenant_seq'
+            """,
+            (self.schema, self.table),
+        )
+        async with conn.transaction():
+            # 1. Counter table. One row per tenant; the trigger takes FOR UPDATE on the
+            #    row, so same-tenant inserts serialize while different tenants never wait.
+            await conn.execute(
+                sql.SQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS {counter} (
+                        tenant_id TEXT PRIMARY KEY,
+                        last_seq BIGINT NOT NULL DEFAULT 0 CHECK (last_seq >= 0)
+                    )
+                    """
+                ).format(counter=self._counter_table())
+            )
+
+            # 2. BEFORE INSERT trigger function. A rolled-back transaction also rolls the
+            #    counter increment back, so failed/aborted inserts consume no numbers.
+            await conn.execute(
+                sql.SQL(
+                    """
+                    CREATE OR REPLACE FUNCTION {fn}() RETURNS trigger
+                    LANGUAGE plpgsql AS $fn$
+                    BEGIN
+                        IF current_setting('app.audit_event_backfill', true) = 'on' THEN
+                            -- One-time backfill path: the migration supplies the number.
+                            RETURN NEW;
+                        END IF;
+                        IF NEW.tenant_seq IS NOT NULL THEN
+                            RAISE EXCEPTION
+                                'tenant_seq is database-assigned and cannot be supplied manually'
+                                USING ERRCODE = 'check_violation';
+                        END IF;
+                        INSERT INTO {counter} AS c (tenant_id, last_seq)
+                        VALUES (NEW.tenant_id, 1)
+                        ON CONFLICT (tenant_id) DO UPDATE
+                            SET last_seq = c.last_seq + 1
+                        RETURNING last_seq INTO NEW.tenant_seq;
+                        RETURN NEW;
+                    END;
+                    $fn$
+                    """
+                ).format(fn=self._assign_fn(), counter=self._counter_table(), table=table)
+            )
+
+            # 3. BEFORE UPDATE guard: tenant identity and the assigned sequence are
+            #    immutable. The backfill session bypasses the guard via the same GUC.
+            await conn.execute(
+                sql.SQL(
+                    """
+                    CREATE OR REPLACE FUNCTION {fn}() RETURNS trigger
+                    LANGUAGE plpgsql AS $fn$
+                    BEGIN
+                        IF current_setting('app.audit_event_backfill', true) = 'on' THEN
+                            RETURN NEW;
+                        END IF;
+                        IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
+                            RAISE EXCEPTION
+                                'tenant_id of an existing event cannot be changed'
+                                USING ERRCODE = 'check_violation';
+                        END IF;
+                        IF NEW.tenant_seq IS DISTINCT FROM OLD.tenant_seq THEN
+                            RAISE EXCEPTION
+                                'tenant_seq is database-assigned and cannot be rewritten'
+                                USING ERRCODE = 'check_violation';
+                        END IF;
+                        RETURN NEW;
+                    END;
+                    $fn$
+                    """
+                ).format(fn=self._guard_fn(), table=table)
+            )
+
+            await conn.execute(
+                sql.SQL("DROP TRIGGER IF EXISTS {trg} ON {table}").format(
+                    trg=sql.Identifier(f"{self.table}_assign_tenant_seq_trg"), table=table
+                )
+            )
+            await conn.execute(
+                sql.SQL("CREATE TRIGGER {trg} BEFORE INSERT ON {table} FOR EACH ROW EXECUTE FUNCTION {fn}()").format(
+                    trg=sql.Identifier(f"{self.table}_assign_tenant_seq_trg"),
+                    table=table,
+                    fn=self._assign_fn(),
+                )
+            )
+            await conn.execute(
+                sql.SQL("DROP TRIGGER IF EXISTS {trg} ON {table}").format(
+                    trg=sql.Identifier(f"{self.table}_guard_event_trg"), table=table
+                )
+            )
+            await conn.execute(
+                sql.SQL("CREATE TRIGGER {trg} BEFORE UPDATE ON {table} FOR EACH ROW EXECUTE FUNCTION {fn}()").format(
+                    trg=sql.Identifier(f"{self.table}_guard_event_trg"),
+                    table=table,
+                    fn=self._guard_fn(),
+                )
+            )
+
+            # 4. Add the nullable column first; rows that already have one (a previous
+            #    completed migration) are never renumbered.
+            if await col_exists.fetchone() is None:
+                await conn.execute(
+                    sql.SQL("ALTER TABLE {table} ADD COLUMN tenant_seq BIGINT").format(table=table)
+                )
+
+            # 5. One-time backfill: existing rows are numbered within each tenant by id
+            #    ascending. GUC switch lets the triggers cooperate in this same transaction.
+            unbackfilled = await conn.execute(
+                sql.SQL("SELECT 1 FROM {table} WHERE tenant_seq IS NULL LIMIT 1").format(table=table)
+            )
+            if await unbackfilled.fetchone() is not None:
+                # The GUC is transaction-local, but if the migration fails the pooled
+                # connection itself survives. A savepoint keeps the outer transaction
+                # usable after a backfill error so the GUC can always be reset: a stale
+                # 'on' on a recycled connection would let later inserts bypass the trigger.
+                try:
+                    async with conn.transaction():
+                        await conn.execute(
+                            sql.SQL("SELECT set_config('app.audit_event_backfill', 'on', true)")
+                        )
+                        await conn.execute(
+                            sql.SQL(
+                                """
+                                UPDATE {table} e SET tenant_seq = sub.seq
+                                FROM (
+                                    SELECT id,
+                                           ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY id) AS seq
+                                    FROM {table}
+                                    WHERE tenant_seq IS NULL
+                                ) sub
+                                WHERE e.id = sub.id
+                                """
+                            ).format(table=table)
+                        )
+                        # Counters must continue at the highest assigned number; take the
+                        # max so a rerun can never rewind a counter and reuse an old number.
+                        await conn.execute(
+                            sql.SQL(
+                                """
+                                INSERT INTO {counter} (tenant_id, last_seq)
+                                SELECT tenant_id, MAX(tenant_seq) FROM {table} GROUP BY tenant_id
+                                ON CONFLICT (tenant_id) DO UPDATE
+                                    SET last_seq = GREATEST({counter}.last_seq, EXCLUDED.last_seq)
+                                """
+                            ).format(counter=self._counter_table(), table=table)
+                        )
+                finally:
+                    await conn.execute(
+                        sql.SQL("SELECT set_config('app.audit_event_backfill', 'off', true)")
+                    )
+
+            # 6. Lock the contract down: no nulls, no duplicate numbers within a tenant.
+            await conn.execute(
+                sql.SQL("ALTER TABLE {table} ALTER COLUMN tenant_seq SET NOT NULL").format(table=table)
+            )
+            await conn.execute(
+                sql.SQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON {table} (tenant_id, tenant_seq)"
+                ).format(
+                    idx=sql.Identifier(f"{self.table}_tenant_seq_idx"), table=table
+                )
+            )
 
     async def health(self) -> str:
         async with self.pool.connection() as conn:
@@ -95,7 +292,7 @@ class Database:
                     """
                     INSERT INTO {table} (tenant_id, event_type, occurred_at, payload)
                     VALUES (%s, %s, COALESCE(%s::timestamptz, now()), %s::jsonb)
-                    RETURNING id, tenant_id, event_type, occurred_at, payload, created_at
+                    RETURNING id, tenant_id, tenant_seq, event_type, occurred_at, payload, created_at
                     """
                 ).format(table=self.qualified_table()),
                 (tenant_id, event_type, occurred_at, json.dumps(payload)),
@@ -107,25 +304,26 @@ class Database:
     ) -> list[dict[str, Any]]:
         async with self.pool.connection() as conn:
             async with conn.transaction():
-                cur = conn.cursor()
-                await cur.executemany(
+                # One multi-row INSERT; the BEFORE INSERT trigger fires per row and
+                # assigns a contiguous tenant_seq per tenant. Any failure rolls the whole
+                # batch and every counter increment back, so no numbers are consumed.
+                row_values = sql.SQL("(%s, %s, COALESCE(%s::timestamptz, now()), %s::jsonb)")
+                values = sql.SQL(", ").join(row_values for _ in rows)
+                params = [arg for t, e, o, p in rows for arg in (t, e, o, json.dumps(p))]
+                cur = await conn.execute(
                     sql.SQL(
                         """
                         INSERT INTO {table} (tenant_id, event_type, occurred_at, payload)
-                        VALUES (%s, %s, COALESCE(%s::timestamptz, now()), %s::jsonb)
+                        VALUES {values}
+                        RETURNING id, tenant_id, tenant_seq, event_type, occurred_at,
+                                  payload, created_at
                         """
-                    ).format(table=self.qualified_table()),
-                    [(t, e, o, json.dumps(p)) for t, e, o, p in rows],
+                    ).format(table=self.qualified_table(), values=values),
+                    params,
                 )
-                cur = await conn.execute(
-                    sql.SQL(
-                        "SELECT id, tenant_id, event_type, occurred_at, payload, created_at "
-                        "FROM {table} ORDER BY id DESC LIMIT %s"
-                    ).format(table=self.qualified_table()),
-                    (len(rows),),
-                )
-                found = await cur.fetchall()
-        return list(reversed(found))
+                inserted = await cur.fetchall()
+        # Return rows in request order; ids are assigned in INSERT order.
+        return sorted(inserted, key=lambda r: r["id"])
 
     async def query_events(
         self,
@@ -134,6 +332,9 @@ class Database:
         event_type: str | None,
         since: datetime | None,
         until: datetime | None,
+        seq_from: int | None,
+        seq_to: int | None,
+        sort: str,
         limit: int,
         offset: int,
     ) -> list[dict[str, Any]]:
@@ -151,14 +352,25 @@ class Database:
         if until:
             conditions.append(sql.SQL("occurred_at < %s"))
             params.append(until)
+        if seq_from is not None:
+            conditions.append(sql.SQL("tenant_seq >= %s"))
+            params.append(seq_from)
+        if seq_to is not None:
+            conditions.append(sql.SQL("tenant_seq <= %s"))
+            params.append(seq_to)
         where = (
             sql.SQL(" WHERE ") + sql.SQL(" AND ").join(conditions) if conditions else sql.SQL("")
         )
-        # Recent-first ordering keeps demo reads useful; LIMIT/OFFSET keep responses small.
+        if sort == "tenant_seq_asc":
+            # Audit/reconciliation order: stable per tenant even when timestamps tie.
+            order = sql.SQL("ORDER BY tenant_id ASC, tenant_seq ASC, id ASC")
+        else:
+            # Recent-first ordering keeps demo reads useful; LIMIT/OFFSET keep responses small.
+            order = sql.SQL("ORDER BY occurred_at DESC, id DESC")
         query = sql.SQL(
-            "SELECT id, tenant_id, event_type, occurred_at, payload, created_at FROM {table}{where} "
-            "ORDER BY occurred_at DESC, id DESC LIMIT %s OFFSET %s"
-        ).format(table=self.qualified_table(), where=where)
+            "SELECT id, tenant_id, tenant_seq, event_type, occurred_at, payload, created_at "
+            "FROM {table}{where} {order} LIMIT %s OFFSET %s"
+        ).format(table=self.qualified_table(), where=where, order=order)
         params.extend([limit, offset])
         async with self.pool.connection() as conn:
             cur = await conn.execute(query, params)

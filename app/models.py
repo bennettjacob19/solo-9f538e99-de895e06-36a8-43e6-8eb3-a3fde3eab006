@@ -89,6 +89,10 @@ class TaskView(BaseModel):
 
 
 class EventCreate(BaseModel):
+    # tenant_seq is intentionally absent and extra fields are forbidden: the sequence
+    # number is assigned by the database and may never be supplied or rewritten by clients.
+    model_config = ConfigDict(extra="forbid")
+
     tenant_id: str = Field(..., min_length=1, max_length=200)
     event_type: str = Field(..., min_length=1, max_length=200)
     occurred_at: datetime | None = Field(
@@ -100,6 +104,8 @@ class EventCreate(BaseModel):
 class EventView(BaseModel):
     id: int
     tenant_id: str
+    # Per-tenant, gapless-on-commit sequence assigned by the database trigger.
+    tenant_seq: int
     event_type: str
     occurred_at: datetime
     payload: dict[str, Any]

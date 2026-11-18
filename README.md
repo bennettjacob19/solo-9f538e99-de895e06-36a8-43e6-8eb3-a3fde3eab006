@@ -4,6 +4,9 @@ FastAPI + PostgreSQL service for a continuously written audit-event table. It ap
 events and builds composite query indexes **online** (`CREATE INDEX CONCURRENTLY`), so
 ingestion and lookups keep working while an index is built or cleaned up.
 
+Every event carries a database-assigned **`tenant_seq`**: a gapless-on-commit, per-tenant
+sequence number that records the exact order in which a tenant's events were committed.
+
 ## Quick start
 
 ```bash
@@ -27,15 +30,18 @@ curl localhost:8000/index-tasks/<task-id>
 
 # query events by tenant and time
 curl 'localhost:8000/events?tenant_id=acme&since=2026-11-01T00:00:00Z'
+
+# audit/reconciliation: walk one tenant's events in commit order via tenant_seq
+curl 'localhost:8000/events?tenant_id=acme&seq_from=100&seq_to=200&sort=tenant_seq_asc'
 ```
 
 ## API
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/events` | Append one event (`tenant_id`, `event_type`, optional `occurred_at`, `payload`). |
-| `POST` | `/events/batch` | Append up to 1000 events in one transaction. |
-| `GET` | `/events` | Query by `tenant_id`, `event_type`, `since`, `until`; `limit`/`offset`. |
+| `POST` | `/events` | Append one event (`tenant_id`, `event_type`, optional `occurred_at`, `payload`). Response includes the database-assigned `tenant_seq`. |
+| `POST` | `/events/batch` | Append up to 1000 events in one transaction; each response row carries its own `tenant_seq`. |
+| `GET` | `/events` | Query by `tenant_id`, `event_type`, `since`, `until`, `seq_from`, `seq_to`; `sort` (`recent`/`tenant_seq_asc`), `limit`/`offset`. |
 | `POST` | `/index-tasks` | Request an index. `mode` is `tenant_time` or `event_type_time`. `202` = new task, `200` = reused, `409` = key reused with another mode. |
 | `GET` | `/index-tasks/{id}` | Task status plus the live catalog state of its index. |
 | `GET` | `/index-tasks` | Recent tasks, or `?operation_key=` lookup. |
@@ -52,6 +58,30 @@ curl 'localhost:8000/events?tenant_id=acme&since=2026-11-01T00:00:00Z'
 | `event_type_time` | `(event_type, occurred_at)` | `audit_events_event_type_occurred_at_idx` |
 
 ## Behaviour guarantees
+
+**Per-tenant sequence (`tenant_seq`).** Each event stores a 1-based sequence number that is
+unique within its tenant and reflects its commit order. Allocation is entirely
+database-side:
+
+* A `BEFORE INSERT` row trigger assigns the number from a per-tenant counter table
+  (`audit_events_tenant_seq`). The counter row is locked `FOR UPDATE`, so concurrent
+  transactions of the **same tenant never get the same number and cannot commit out of
+  order**; different tenants lock different rows and never wait on each other.
+* This applies to every insert path — the single API, the batch API and plain SQL
+  `INSERT`. Clients cannot supply or rewrite `tenant_seq` (the write model forbids the
+  field and the trigger rejects a non-null value); a `BEFORE UPDATE` trigger also forbids
+  changing `tenant_id` or `tenant_seq` on an existing event.
+* Because the counter increment lives in the same transaction as the insert, a rollback
+  rolls the increment back too: aborted or failed writes consume **no** numbers. Deleting
+  an event never frees its number, so old numbers are never reused.
+* First-time enablement backfills pre-existing rows with `ROW_NUMBER() OVER (PARTITION BY
+  tenant_id ORDER BY id)` — contiguous within each tenant, by ascending `id`. The whole
+  migration (column, counter table, triggers, backfill, `NOT NULL`, unique index) runs in
+  one transaction: a failure rolls everything back, leaving no half-backfilled table. It
+  is idempotent, so a restart never renumbers existing events and never rewinds a counter.
+* Single and batch write responses return each event's own `tenant_seq`. `GET /events`
+  supports `seq_from`/`seq_to` (requires `tenant_id`) and `sort=tenant_seq_asc` for
+  audit-order reconciliation; a unique index on `(tenant_id, tenant_seq)` backs the lookup.
 
 **Idempotency.** Partial unique indexes on `index_tasks` allow at most one *active*
 (`queued`/`running`) task per `operation_key` and per `index_name`:
