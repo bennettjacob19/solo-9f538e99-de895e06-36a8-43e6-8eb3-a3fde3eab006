@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: audit
+      POSTGRES_PASSWORD: audit
+      POSTGRES_DB: audit
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U audit -d audit"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build: .
+    environment:
+      AUDIT_DATABASE_URL: postgresql://audit:audit@db:5432/audit
+      AUDIT_DB_SCHEMA: public
+      AUDIT_EVENTS_TABLE: audit_events
+      AUDIT_BUILD_TIMEOUT_SECONDS: "900"
+      AUDIT_SUPERVISOR_INTERVAL_SECONDS: "2"
+      AUDIT_RECONCILE_GRACE_SECONDS: "10"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
